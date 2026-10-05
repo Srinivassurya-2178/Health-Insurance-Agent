@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+gunicorn
+langserve
+langchain
+langchain-core
+langchain-google-genai
+langchain-community
+requests
+sse_starlette
+pydantic
+pypdf
