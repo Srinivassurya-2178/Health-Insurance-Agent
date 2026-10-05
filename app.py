@@ -5,7 +5,9 @@ from fastapi import FastAPI
 from langserve import add_routes
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_agent
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import chain
 from pydantic import BaseModel, Field
 
 # 1. Define Tools
@@ -48,31 +50,38 @@ tools = [check_policy_coverage, calculate_premium_estimate, guide_claim_submissi
 
 # 2. Model & Agent Setup
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", api_key=GEMINI_API_KEY)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=GEMINI_API_KEY)
 
-system_prompt = (
-    "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance inquiries. "
-    "For non-health insurance topics, answer strictly: 'I am not authorized to answer questions outside of health insurance.'"
-)
+prompt = ChatPromptTemplate.from_messages([
+    ("system", (
+        "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance inquiries. "
+        "For non-health insurance topics, answer strictly: 'I am not authorized to answer questions outside of health insurance.'"
+    )),
+    MessagesPlaceholder(variable_name="messages"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
 
-agent = create_agent(
-    model=llm,
-    tools=tools,
-    system_prompt=system_prompt
-)
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools)
 
-# 3. Input Schema for LangServe
-class InputSchema(BaseModel):
-    input: str = Field(..., description="Enter your health insurance inquiry here")
+# 3. Input Schema
+class AgentInput(BaseModel):
+    input: str = Field(..., description="Health insurance query")
+
+# 4. Wrap with @chain decorator to format output directly for LangServe UI
+@chain
+def health_agent_chain(inputs: dict) -> str:
+    user_query = inputs.get("input", "") if isinstance(inputs, dict) else str(inputs)
+    result = agent_executor.invoke({"messages": [("user", user_query)]})
+    return result.get("output", "")
 
 app = FastAPI(title="Health Insurance Agent API", version="1.0")
 
-# 4. Mount LangServe Route
+# 5. Add LangServe Routes
 add_routes(
     app,
-    agent.with_types(input_type=InputSchema),
-    path="/agent",
-    playground_type="default"
+    health_agent_chain.with_types(input_type=AgentInput),
+    path="/agent"
 )
 
 if __name__ == "__main__":
