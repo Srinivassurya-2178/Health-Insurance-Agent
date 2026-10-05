@@ -1,13 +1,16 @@
 import os
-import uvicorn
 import json
+import uvicorn
 from fastapi import FastAPI
 from langserve import add_routes
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_agent
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, Field
 
+# 1. Define Tools
 @tool
 def check_policy_coverage(plan_type: str, procedure_name: str) -> str:
     """Check coverage status, copay, and deductible for a specific medical procedure under a plan tier."""
@@ -17,11 +20,7 @@ def check_policy_coverage(plan_type: str, procedure_name: str) -> str:
         "gold": {"coverage": "90%", "copay": "$15", "pre_auth_required": False}
     }
     plan_info = plans.get(plan_type.lower(), {"coverage": "70%", "copay": "$35", "pre_auth_required": True})
-    return json.dumps({
-        "plan_type": plan_type,
-        "procedure": procedure_name,
-        "details": plan_info
-    })
+    return json.dumps({"plan_type": plan_type, "procedure": procedure_name, "details": plan_info})
 
 @tool
 def calculate_premium_estimate(age: int, plan_tier: str, family_members: int) -> str:
@@ -29,17 +28,8 @@ def calculate_premium_estimate(age: int, plan_tier: str, family_members: int) ->
     base_rate = 150 if age < 30 else (250 if age < 50 else 400)
     tier_multiplier = {"basic": 1.0, "silver": 1.3, "gold": 1.7}.get(plan_tier.lower(), 1.0)
     family_cost = (family_members - 1) * 100 if family_members > 1 else 0
-    
     monthly_total = int((base_rate * tier_multiplier) + family_cost)
-    annual_total = monthly_total * 12
-    
-    return json.dumps({
-        "age": age,
-        "plan_tier": plan_tier,
-        "family_members": family_members,
-        "monthly_estimate_usd": monthly_total,
-        "annual_estimate_usd": annual_total
-    })
+    return json.dumps({"monthly_estimate_usd": monthly_total, "annual_estimate_usd": monthly_total * 12})
 
 @tool
 def guide_claim_submission(claim_type: str) -> str:
@@ -47,54 +37,51 @@ def guide_claim_submission(claim_type: str) -> str:
     if "cashless" in claim_type.lower():
         return json.dumps({
             "claim_type": "Cashless",
-            "steps": [
-                "Show health card at network hospital desk.",
-                "Fill out Pre-Authorization Form 48 hours prior to planned treatment.",
-                "Hospital submits claim directly to insurer."
-            ],
-            "required_docs": ["Health Card ID", "Government Photo ID", "Doctor Recommendation Letter"]
+            "steps": ["Show health card at network hospital desk.", "Submit Pre-Authorization Form."],
+            "required_docs": ["Health Card ID", "Government Photo ID"]
         })
-    else:
-        return json.dumps({
-            "claim_type": "Reimbursement",
-            "steps": [
-                "Pay hospital bills directly during discharge.",
-                "Submit claim form within 15 days of discharge.",
-                "Upload itemized bills and discharge summary."
-            ],
-            "required_docs": ["Original Hospital Bills", "Discharge Summary", "Payment Receipts", "Cancelled Check"]
-        })
+    return json.dumps({
+        "claim_type": "Reimbursement",
+        "steps": ["Pay hospital bills directly.", "Submit claim form within 15 days."],
+        "required_docs": ["Original Bills", "Discharge Summary"]
+    })
 
 tools = [check_policy_coverage, calculate_premium_estimate, guide_claim_submission]
+
+# 2. Model & Agent Setup
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", api_key=GEMINI_API_KEY)
 
-llm_flash = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    api_key=GEMINI_API_KEY
-)
+prompt = ChatPromptTemplate.from_messages([
+    ("system", (
+        "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance inquiries. "
+        "For non-health insurance topics, answer strictly: 'I am not authorized to answer questions outside of health insurance.'"
+    )),
+    MessagesPlaceholder(variable_name="messages"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
 
-agent = create_agent(
-    model=llm_flash,
-    tools=tools,
-    system_prompt=(
-        "You are a specialized Health Insurance AI Assistant restricted strictly to policy coverage inquiries, "
-        "premium estimations, and claims submission guidance. For any question outside health insurance, "
-        "you must answer strictly: 'I am not authorized to answer questions outside of health insurance coverage, premiums, and claims.'"
-    )
-)
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools)
 
+# 3. Input Schema
 class InputSchema(BaseModel):
     input: str = Field(..., description="Enter your health insurance inquiry here")
 
-app = FastAPI(
-    title="Health Insurance Agent API",
-    version="1.0",
-    description="A deployment of a Health Insurance LangChain agent using Google Gemini"
-)
+# Helper function to map UI string input cleanly to agent executor
+def run_agent(input_data: InputSchema) -> str:
+    query = input_data.input if isinstance(input_data, InputSchema) else input_data.get("input", "")
+    response = agent_executor.invoke({"messages": [("user", query)]})
+    return response.get("output", "")
 
+runnable_agent = RunnableLambda(run_agent).with_types(input_type=InputSchema)
+
+app = FastAPI(title="Health Insurance Agent API", version="1.0")
+
+# 4. Mount LangServe Route
 add_routes(
     app,
-    agent.with_types(input_type=InputSchema),
+    runnable_agent,
     path="/agent",
     playground_type="default"
 )
