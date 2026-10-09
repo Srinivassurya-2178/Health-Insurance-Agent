@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import chain
 from pydantic import BaseModel, Field
 
-# 1. Define Custom Tools
+# 1. Custom Tools
 @tool
 def check_policy_coverage(plan_type: str, procedure_name: str) -> str:
     """Check coverage status, copay, and deductible for a specific medical procedure under a plan tier."""
@@ -48,55 +48,59 @@ def guide_claim_submission(claim_type: str) -> str:
 tools = [check_policy_coverage, calculate_premium_estimate, guide_claim_submission]
 tools_by_name = {t.name: t for t in tools}
 
-# 2. Model Initialization with Bound Tools
+# 2. Gemini Setup
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Using stable supported model string
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    api_key=GEMINI_API_KEY,
-    temperature=0.1
+    model="gemini-1.5-flash",
+    google_api_key=GEMINI_API_KEY,
+    temperature=0.2
 )
+
+# Bind tools to Gemini
 llm_with_tools = llm.bind_tools(tools)
 
-SYSTEM_INSTRUCTION = SystemMessage(content=(
-    "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance inquiries. "
-    "Use the provided tools to fetch policy coverage, premium estimations, and claim guidelines. "
-    "For non-health insurance topics, answer strictly: 'I am not authorized to answer questions outside of health insurance.'"
+SYSTEM_PROMPT = SystemMessage(content=(
+    "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance queries. "
+    "Use the provided tools to fetch policy details, calculate premiums, or give claim submission guides. "
+    "For topics unrelated to health insurance, respond strictly: 'I am not authorized to answer questions outside of health insurance.'"
 ))
 
-# 3. Custom Agent Executor Runnable
+# 3. Chain Runnable Setup
 @chain
-def agent_executor(inputs: dict) -> str:
+def agent_chain(inputs: dict) -> str:
     user_query = inputs.get("input", "") if isinstance(inputs, dict) else str(inputs)
-    messages = [SYSTEM_INSTRUCTION, HumanMessage(content=user_query)]
+    messages = [SYSTEM_PROMPT, HumanMessage(content=user_query)]
     
-    # First LLM Call
+    # First invocation
     ai_msg = llm_with_tools.invoke(messages)
     messages.append(ai_msg)
     
-    # Handle Tool Calls
-    if ai_msg.tool_calls:
+    # Process tool execution if tool calls exist
+    if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
         for tool_call in ai_msg.tool_calls:
-            selected_tool = tools_by_name.get(tool_call["name"])
-            if selected_tool:
-                tool_output = selected_tool.invoke(tool_call["args"])
+            tool_name = tool_call["name"]
+            if tool_name in tools_by_name:
+                tool_output = tools_by_name[tool_name].invoke(tool_call["args"])
                 messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
         
-        # Second LLM Call with Tool Results
-        final_response = llm.invoke(messages)
-        return str(final_response.content)
+        # Second invocation after tool outputs
+        final_msg = llm.invoke(messages)
+        return str(final_msg.content)
     
     return str(ai_msg.content)
 
 # 4. Input Schema
 class AgentInput(BaseModel):
-    input: str = Field(..., description="Health insurance inquiry")
+    input: str = Field(..., description="Health insurance query")
 
 app = FastAPI(title="Health Insurance Agent API", version="1.0")
 
 # 5. Add LangServe Route
 add_routes(
     app,
-    agent_executor.with_types(input_type=AgentInput),
+    agent_chain.with_types(input_type=AgentInput),
     path="/agent"
 )
 
