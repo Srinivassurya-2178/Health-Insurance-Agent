@@ -5,11 +5,11 @@ from fastapi import FastAPI
 from langserve import add_routes
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import chain
 from pydantic import BaseModel, Field
 
-# 1. Define Tools
+# 1. Define Custom Tools
 @tool
 def check_policy_coverage(plan_type: str, procedure_name: str) -> str:
     """Check coverage status, copay, and deductible for a specific medical procedure under a plan tier."""
@@ -46,37 +46,57 @@ def guide_claim_submission(claim_type: str) -> str:
     })
 
 tools = [check_policy_coverage, calculate_premium_estimate, guide_claim_submission]
+tools_by_name = {t.name: t for t in tools}
 
-# 2. Model & Agent Setup
+# 2. Model Initialization with Bound Tools
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    google_api_key=GEMINI_API_KEY,
+    model="gemini-2.5-flash",
+    api_key=GEMINI_API_KEY,
     temperature=0.1
 )
+llm_with_tools = llm.bind_tools(tools)
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", (
-        "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance inquiries. "
-        "Use the provided tools to answer queries about policy coverage, premiums, and claims. "
-        "For non-health insurance topics, answer strictly: 'I am not authorized to answer questions outside of health insurance.'"
-    )),
-    MessagesPlaceholder(variable_name="chat_history", optional=True),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
+SYSTEM_INSTRUCTION = SystemMessage(content=(
+    "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance inquiries. "
+    "Use the provided tools to fetch policy coverage, premium estimations, and claim guidelines. "
+    "For non-health insurance topics, answer strictly: 'I am not authorized to answer questions outside of health insurance.'"
+))
 
-agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+# 3. Custom Agent Executor Runnable
+@chain
+def agent_executor(inputs: dict) -> str:
+    user_query = inputs.get("input", "") if isinstance(inputs, dict) else str(inputs)
+    messages = [SYSTEM_INSTRUCTION, HumanMessage(content=user_query)]
+    
+    # First LLM Call
+    ai_msg = llm_with_tools.invoke(messages)
+    messages.append(ai_msg)
+    
+    # Handle Tool Calls
+    if ai_msg.tool_calls:
+        for tool_call in ai_msg.tool_calls:
+            selected_tool = tools_by_name.get(tool_call["name"])
+            if selected_tool:
+                tool_output = selected_tool.invoke(tool_call["args"])
+                messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
+        
+        # Second LLM Call with Tool Results
+        final_response = llm.invoke(messages)
+        return str(final_response.content)
+    
+    return str(ai_msg.content)
 
-# 3. FastAPI Application
+# 4. Input Schema
+class AgentInput(BaseModel):
+    input: str = Field(..., description="Health insurance inquiry")
+
 app = FastAPI(title="Health Insurance Agent API", version="1.0")
 
-# 4. Mount LangServe Route
+# 5. Add LangServe Route
 add_routes(
     app,
-    agent_executor,
+    agent_executor.with_types(input_type=AgentInput),
     path="/agent"
 )
 
