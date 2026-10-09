@@ -48,26 +48,25 @@ def guide_claim_submission(claim_type: str) -> str:
 tools = [check_policy_coverage, calculate_premium_estimate, guide_claim_submission]
 tools_by_name = {t.name: t for t in tools}
 
-# 2. Gemini Setup
+# 2. Gemini Initialization
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Using stable supported model string
 llm = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
     google_api_key=GEMINI_API_KEY,
     temperature=0.2
 )
 
-# Bind tools to Gemini
+# Explicitly bind tools to model
 llm_with_tools = llm.bind_tools(tools)
 
 SYSTEM_PROMPT = SystemMessage(content=(
     "You are a specialized Health Insurance AI Assistant restricted strictly to health insurance queries. "
-    "Use the provided tools to fetch policy details, calculate premiums, or give claim submission guides. "
-    "For topics unrelated to health insurance, respond strictly: 'I am not authorized to answer questions outside of health insurance.'"
+    "Use the provided tools to calculate premiums, check policy coverage, or provide claim guidance. "
+    "For queries unrelated to health insurance, respond strictly: 'I am not authorized to answer questions outside of health insurance.'"
 ))
 
-# 3. Chain Runnable Setup
+# 3. Agent Execution Chain
 @chain
 def agent_chain(inputs: dict) -> str:
     user_query = inputs.get("input", "") if isinstance(inputs, dict) else str(inputs)
@@ -77,7 +76,7 @@ def agent_chain(inputs: dict) -> str:
     ai_msg = llm_with_tools.invoke(messages)
     messages.append(ai_msg)
     
-    # Process tool execution if tool calls exist
+    # Process tools if Gemini requested tool calls
     if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
         for tool_call in ai_msg.tool_calls:
             tool_name = tool_call["name"]
@@ -85,7 +84,7 @@ def agent_chain(inputs: dict) -> str:
                 tool_output = tools_by_name[tool_name].invoke(tool_call["args"])
                 messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
         
-        # Second invocation after tool outputs
+        # Second invocation after feeding tool results back to LLM
         final_msg = llm.invoke(messages)
         return str(final_msg.content)
     
@@ -97,7 +96,7 @@ class AgentInput(BaseModel):
 
 app = FastAPI(title="Health Insurance Agent API", version="1.0")
 
-# 5. Add LangServe Route
+# 5. LangServe Routing
 add_routes(
     app,
     agent_chain.with_types(input_type=AgentInput),
